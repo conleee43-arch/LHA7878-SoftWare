@@ -159,9 +159,36 @@ int main(void)
   if (status != LHA7878_OK) {
       printf("[ERROR] LHA7878 init failed! Error code: %d\r\n", (int)status);
       switch (status) {
-          case LHA7878_ERR_ID:
+          case LHA7878_ERR_ID: {
               printf("        Reason: Chip ID mismatch (Check SPI connection & MISO pin)\r\n");
+              /* 诊断: START 拉高让芯片开始转换, 再观察 DRDY / 原始数据 / ID 重复读 */
+              lha7878_start_pin(&g_adc_dev, true);
+              HAL_Delay(5);
+              uint32_t drdy_lows = 0;
+              uint32_t t0 = HAL_GetTick();
+              while (HAL_GetTick() - t0 < 20u) {
+                  if (lha7878_drdy_is_low(&g_adc_dev)) { drdy_lows++; }
+              }
+              printf("        Debug: DRDY low samples in 20ms = %lu (0 = no conversion/CLK)\r\n",
+                     (unsigned long)drdy_lows);
+              {
+                  uint8_t tx[27] = {0}, rx[27] = {0};
+                  HAL_GPIO_WritePin(LHA7878_SPI2_CS_GPIO_Port, LHA7878_SPI2_CS_Pin, GPIO_PIN_RESET);
+                  HAL_StatusTypeDef hs = HAL_SPI_TransmitReceive(g_adc_dev.hspi, tx, rx, 27u, 100u);
+                  HAL_GPIO_WritePin(LHA7878_SPI2_CS_GPIO_Port, LHA7878_SPI2_CS_Pin, GPIO_PIN_SET);
+                  printf("        Debug: raw27 (st=%d):", (int)hs);
+                  for (uint8_t i = 0; i < 27u; i++) { printf(" %02X", (unsigned)rx[i]); }
+                  printf("\r\n");
+              }
+              for (uint8_t i = 0; i < 4u; i++) {
+                  uint8_t v = 0;
+                  lha7878_status_t r = lha7878_read_reg(&g_adc_dev, LHA7878_REG_ID, &v);
+                  printf("        Debug: ID retry[%u]=0x%02X (st=%d)\r\n",
+                         (unsigned)i, (unsigned)v, (int)r);
+              }
+              lha7878_start_pin(&g_adc_dev, false);
               break;
+          }
           case LHA7878_ERR_VERIFY:
               printf("        Reason: Register write-verify failed (Check SPI Mode 1 / CPHA=2Edge)\r\n");
               break;
