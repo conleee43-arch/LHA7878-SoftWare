@@ -1,0 +1,23 @@
+# Keil MDK intermediate files
+*.o
+*.d
+*.crf
+*.dep
+*.map
+*.lst
+*.lnp
+*.build_log.htm
+*.htm
+
+# Keil user-specific config
+*.uvguix.*
+JLinkLog.txt
+JLinkSettings.ini
+
+# Output directory contents except keeping folder structure if needed
+MDK-ARM/LH787X-SoftWare/
+
+# System files
+.DS_Store
+Thumbs.db
+*.bak
