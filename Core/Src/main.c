@@ -216,6 +216,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   uint32_t last_print_tick = 0;
   uint32_t sample_count = 0;
+  uint32_t row_count = 0;
 
   while (1)
   {
@@ -232,24 +233,22 @@ int main(void)
             last_print_tick = now;
             HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
 
-            printf("[Frame #%lu] Approx Rate: %lu sps | FaultP=0x%02X FaultN=0x%02X\r\n",
-                   (unsigned long)g_frame.frame_index,
-                   (unsigned long)(sample_count * 5),
-                   g_frame.fault_p, g_frame.fault_n);
+            /* 每 20 行重印表头, 便于滚动时对照列; 每帧一行, 纵向对比同一通道. */
+            if (row_count % 20u == 0u) {
+                printf("\r\n  Approx Rate: %lu sps\r\n", (unsigned long)(sample_count * 5));
+                printf("  Frame |    CH1    |    CH2    |    CH3    |    CH4    |    CH5    |    CH6    |    CH7    |    CH8    |  mV\r\n");
+            }
             sample_count = 0;
+            row_count++;
 
-            printf("  CH1: %+9lld uV (%+8.3f mV) | CH2: %+9lld uV (%+8.3f mV)\r\n",
-                   (long long)g_uv[0], (double)g_uv[0] / 1000.0,
-                   (long long)g_uv[1], (double)g_uv[1] / 1000.0);
-            printf("  CH3: %+9lld uV (%+8.3f mV) | CH4: %+9lld uV (%+8.3f mV)\r\n",
-                   (long long)g_uv[2], (double)g_uv[2] / 1000.0,
-                   (long long)g_uv[3], (double)g_uv[3] / 1000.0);
-            printf("  CH5: %+9lld uV (%+8.3f mV) | CH6: %+9lld uV (%+8.3f mV)\r\n",
-                   (long long)g_uv[4], (double)g_uv[4] / 1000.0,
-                   (long long)g_uv[5], (double)g_uv[5] / 1000.0);
-            printf("  CH7: %+9lld uV (%+8.3f mV) | CH8: %+9lld uV (%+8.3f mV)\r\n",
-                   (long long)g_uv[6], (double)g_uv[6] / 1000.0,
-                   (long long)g_uv[7], (double)g_uv[7] / 1000.0);
+            printf("%7lu |", (unsigned long)g_frame.frame_index);
+            for (uint8_t i = 0; i < 8u; i++) {
+                printf(" %+9.3f |", (double)g_uv[i] / 1000.0);
+            }
+            if (g_frame.fault_p != 0u || g_frame.fault_n != 0u) {
+                printf("  FAULT P=0x%02X N=0x%02X", g_frame.fault_p, g_frame.fault_n);
+            }
+            printf("\r\n");
         }
     } else if (st == LHA7878_ERR_TIMEOUT) {
         uint32_t now = HAL_GetTick();
