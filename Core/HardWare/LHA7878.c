@@ -1,6 +1,7 @@
 /* LHA7878 驱动 -- 完善版, 依据 LHA787X Datasheet CN Rev.D.
  * 编码 UTF-8 无 BOM. 详见 LHA7878.h 头部说明与核对章节清单. */
 #include "LHA7878.h"
+#include <stdio.h>
 
 #ifndef __weak
 #define __weak __attribute__((weak))
@@ -504,6 +505,22 @@ lha7878_status_t lha7878_exit_rdatac(lha7878_dev_t *dev)
 }
 
 /* ------------------------------ 初始化 ---------------------------------- */
+/* 写后回读校验, 失败时打印寄存器地址/写入值/回读值, 便于 bring-up 定位. */
+static lha7878_status_t dbg_write_verify(lha7878_dev_t *dev, uint8_t addr, uint8_t value)
+{
+    lha7878_status_t st = lha7878_write_reg(dev, addr, value);
+    uint8_t back = 0;
+    if (st != LHA7878_OK) { return st; }
+    st = lha7878_read_reg(dev, addr, &back);
+    if (st != LHA7878_OK) { return st; }
+    if (back != value) {
+        printf("[DBG] reg 0x%02X verify fail: wrote 0x%02X, read 0x%02X\r\n",
+               (unsigned)addr, (unsigned)value, (unsigned)back);
+        return LHA7878_ERR_VERIFY;
+    }
+    return LHA7878_OK;
+}
+
 static lha7878_status_t write_config_registers(lha7878_dev_t *dev)
 {
     lha7878_status_t st;
@@ -515,7 +532,7 @@ static lha7878_status_t write_config_registers(lha7878_dev_t *dev)
     config3 = 0u;
     if (c->vref != LHA7878_VREF_EXT) { config3 |= LHA7878_CONFIG3_PDB_REFBUF; }
     if (c->vref == LHA7878_VREF_INT_4V) { config3 |= LHA7878_CONFIG3_VREF_4V; }
-    st = lha7878_write_reg_verify(dev, LHA7878_REG_CONFIG3, config3);
+    st = dbg_write_verify(dev, LHA7878_REG_CONFIG3, config3);
     if (st != LHA7878_OK) { return st; }
     if (c->vref != LHA7878_VREF_EXT) { lha7878_delay_ms(10u); }
 
@@ -523,17 +540,17 @@ static lha7878_status_t write_config_registers(lha7878_dev_t *dev)
                          (c->multi_readback ? (1u << 6) : 0u) |
                          (c->clk_en ? (1u << 5) : 0u) |
                          (uint8_t)c->data_rate);
-    st = lha7878_write_reg_verify(dev, LHA7878_REG_CONFIG1, config1);
+    st = dbg_write_verify(dev, LHA7878_REG_CONFIG1, config1);
     if (st != LHA7878_OK) { return st; }
 
     config2 = (uint8_t)(LHA7878_CONFIG2_FIXED |
                          (c->test_int ? (1u << 4) : 0u) |
                          (c->test_freq & 0x03u));
-    st = lha7878_write_reg_verify(dev, LHA7878_REG_CONFIG2, config2);
+    st = dbg_write_verify(dev, LHA7878_REG_CONFIG2, config2);
     if (st != LHA7878_OK) { return st; }
 
-    st = lha7878_write_reg_verify(dev, LHA7878_REG_FAULT,
-                                  (uint8_t)(c->fault_th << LHA7878_FAULT_COMP_TH_SHIFT));
+    st = dbg_write_verify(dev, LHA7878_REG_FAULT,
+                          (uint8_t)(c->fault_th << LHA7878_FAULT_COMP_TH_SHIFT));
     if (st != LHA7878_OK) { return st; }
 
     st = lha7878_write_all_channels(dev);
@@ -544,15 +561,31 @@ static lha7878_status_t write_config_registers(lha7878_dev_t *dev)
         st = lha7878_read_regs(dev, LHA7878_REG_CH1SET, back, 8u);
         if (st != LHA7878_OK) { return st; }
         for (uint8_t i = 0; i < 8u; i++) {
-            if (back[i] != chnset_byte(c->gain[i], c->mux[i], c->channel_pd[i])) {
+            uint8_t expect = chnset_byte(c->gain[i], c->mux[i], c->channel_pd[i]);
+            if (back[i] != expect) {
+                printf("[DBG] CH%uSET verify fail: wrote 0x%02X, read 0x%02X\r\n",
+                       (unsigned)(i + 1u), (unsigned)expect, (unsigned)back[i]);
                 return LHA7878_ERR_VERIFY;
             }
         }
     }
-    /* GPIO 方向/输出值 (复位值 0x0F, 全输入). */
-    return lha7878_write_reg_verify(dev, LHA7878_REG_GPIO,
-                                    (uint8_t)(((c->gpio_out & 0x0Fu) << 4) |
-                                              (c->gpio_dir & 0x0Fu)));
+    /* GPIO (§9.6.1.9 表38): GPIOD[7:4] 回读的是引脚实际电平, 与方向无关,
+     * 不能用整字节相等校验; 只校验可回读的方向位 GPIOC[3:0]. */
+    {
+        uint8_t gpio_val = (uint8_t)(((c->gpio_out & 0x0Fu) << 4) |
+                                     (c->gpio_dir & 0x0Fu));
+        uint8_t back = 0;
+        st = lha7878_write_reg(dev, LHA7878_REG_GPIO, gpio_val);
+        if (st != LHA7878_OK) { return st; }
+        st = lha7878_read_reg(dev, LHA7878_REG_GPIO, &back);
+        if (st != LHA7878_OK) { return st; }
+        if ((back & 0x0Fu) != (c->gpio_dir & 0x0Fu)) {
+            printf("[DBG] GPIO dir verify fail: wrote 0x%02X, read 0x%02X\r\n",
+                   (unsigned)gpio_val, (unsigned)back);
+            return LHA7878_ERR_VERIFY;
+        }
+    }
+    return LHA7878_OK;
 }
 
 lha7878_status_t lha7878_init(lha7878_dev_t *dev)
@@ -777,7 +810,13 @@ lha7878_status_t lha7878_gpio_write(lha7878_dev_t *dev, uint8_t gpiod_out, uint8
     dev->cfg.gpio_out = (uint8_t)(gpiod_out & 0x0Fu);
     dev->cfg.gpio_dir = (uint8_t)(gpioc_dir & 0x0Fu);
     v = (uint8_t)(((dev->cfg.gpio_out & 0x0Fu) << 4) | (dev->cfg.gpio_dir & 0x0Fu));
-    return lha7878_write_reg_verify(dev, LHA7878_REG_GPIO, v);
+    /* GPIOD[7:4] 回读为引脚电平, 只校验方向位 GPIOC[3:0] (§9.6.1.9). */
+    lha7878_status_t st = lha7878_write_reg(dev, LHA7878_REG_GPIO, v);
+    uint8_t back = 0;
+    if (st != LHA7878_OK) { return st; }
+    st = lha7878_read_reg(dev, LHA7878_REG_GPIO, &back);
+    if (st != LHA7878_OK) { return st; }
+    return ((back & 0x0Fu) == (dev->cfg.gpio_dir & 0x0Fu)) ? LHA7878_OK : LHA7878_ERR_VERIFY;
 }
 
 /* ------------------------------ 自检 ------------------------------------ */

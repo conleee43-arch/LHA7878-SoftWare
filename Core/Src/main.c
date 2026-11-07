@@ -146,7 +146,7 @@ int main(void)
   cfg.avdd_mv   = 5000;                   /* 板上 AVDD 是 5V */
   cfg.dvdd_mv   = 3300;                   /* DVDD 3.3V */
   cfg.clk_hz    = 2048000;                /* TODO: 待确认外部 2.048MHz 还是内部振荡器 */
-  cfg.sclk_hz   = 10000000;               /* 10MHz */
+  cfg.sclk_hz   = 4687500;                /* 实际 SCLK = PLL1Q 75MHz / 16 */
   for (uint8_t i = 0; i < 8; i++) {
       cfg.gain[i] = LHA7878_GAIN_1;        /* 全通道增益 1 */
       cfg.mux[i]  = LHA7878_MUX_NORMAL;    /* 全通道正常输入 */
