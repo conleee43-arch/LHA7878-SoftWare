@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 #include "LHA7878.h"
 /* USER CODE END Includes */
 
@@ -55,11 +56,145 @@ static int64_t         g_uv[8];
 void SystemClock_Config(void);
 static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
-
+void DMA1_Stream7_IRQHandler(void);
+void USART2_IRQHandler(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ---------------------------------------------------------------------------
+ * USART2 发送改为 DMA (DMA1 Stream7, 请求 USART2_TX)
+ *
+ * 原问题: fputc 逐字节调 HAL_UART_Transmit 轮询发送, 一行由十几次 printf
+ * 拼成、每字节一次 HAL 调用, 打印期间 CPU 被占约 10~15ms, 行不是原子发出,
+ * 调试助手上偶发格式错乱; 且打印阻塞期间 SPI 读数会丢帧.
+ *
+ * 新路径: printf 仍走 fputc/__io_putchar, 但字符先攒进行缓冲, 遇 '\n' 或
+ * 缓冲满时整行一次 DMA 发出; 上一笔 DMA 未完成时下一笔等待 (100ms 超时
+ * 后回落轮询发送, 串口输出永不丢字节).
+ *
+ * 必须同时使能 USART2_IRQn: 本工程 HAL 的 DMA 发送完成分两步, DMA 传完
+ * 后只置位 UART TCIE, 真正的收尾 (gState 回 READY、调
+ * HAL_UART_TxCpltCallback) 在 UART TC 中断里; 不使能 USART2 中断则
+ * gState 永久 BUSY_TX、发送完成回调永不执行.
+ *
+ * 约束 (手工初始化, 未走 CubeMX):
+ *  - CubeMX 侧不要再勾选 USART2 的 DMA, 否则会与这里冲突 (CubeMX 会再
+ *    生成一个 DMA1_Stream7_IRQHandler, 链接报重定义). 若改由 CubeMX
+ *    接管 DMA, 需先删除本段手工初始化与 USER CODE 4 里的两个中断函数.
+ *  - 缓冲区在 .bss, 默认 scatter 下位于 0x24000000 AXI SRAM, DMA1 可
+ *    访问; 不要把它移到 DTCM (0x20000000, DMA1 不可访问).
+ *  - 本工程未使能 D-Cache, 故 DMA 读缓冲前无需 clean; 若将来使能
+ *    D-Cache, 下面 SCB_CleanDCache_by_Addr 一行已预留 (当前是空操作).
+ * ------------------------------------------------------------------------- */
+#define UART_DMA_TX_BUF_SIZE 256u   /* 单行上限: 表格行约 137 字节, 表头约 110 字节 */
+#define UART_DMA_TX_WAIT_MS  100u
+
+static DMA_HandleTypeDef hdma_usart2_tx;
+static uint8_t  uart_dma_tx_buf[UART_DMA_TX_BUF_SIZE];
+static char     uart_dma_line_buf[UART_DMA_TX_BUF_SIZE];
+static uint16_t uart_dma_line_len = 0u;
+static volatile uint8_t uart_dma_tx_busy = 0u;
+static uint8_t  uart_dma_ready = 0u;
+
+static void uart_dma_init(void);
+static void uart_dma_send(const uint8_t *data, uint16_t len);
+static void uart_dma_flush_line(void);
+static void uart_putc_dma(int ch);
+
+static void uart_dma_init(void)
+{
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  hdma_usart2_tx.Instance = DMA1_Stream7;
+  hdma_usart2_tx.Init.Request = DMA_REQUEST_USART2_TX;
+  hdma_usart2_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+  hdma_usart2_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+  hdma_usart2_tx.Init.MemInc = DMA_MINC_ENABLE;
+  hdma_usart2_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+  hdma_usart2_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+  hdma_usart2_tx.Init.Mode = DMA_NORMAL;
+  hdma_usart2_tx.Init.Priority = DMA_PRIORITY_LOW;
+  hdma_usart2_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+  if (HAL_DMA_Init(&hdma_usart2_tx) != HAL_OK)
+  {
+    uart_dma_ready = 0u;  /* DMA 不可用: 自动回落轮询发送, 串口不断 */
+    return;
+  }
+  __HAL_LINKDMA(&huart2, hdmatx, hdma_usart2_tx);
+
+  HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream7_IRQn);
+  /* DMA 发完后 HAL 在 UART TC 中断里收尾, 必须使能 USART2 中断 */
+  HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
+  uart_dma_ready = 1u;
+}
+
+static void uart_dma_send(const uint8_t *data, uint16_t len)
+{
+  uint32_t tick;
+  if (len == 0u)
+  {
+    return;
+  }
+  if (!uart_dma_ready)
+  {
+    HAL_UART_Transmit(&huart2, (uint8_t *)data, len, 1000);
+    return;
+  }
+  /* 等上一笔 DMA 发完 (稳态下此时早已发完, 不阻塞); 超时则强行中止并轮询补发 */
+  tick = HAL_GetTick();
+  while (uart_dma_tx_busy)
+  {
+    if ((HAL_GetTick() - tick) >= UART_DMA_TX_WAIT_MS)
+    {
+      (void)HAL_UART_AbortTransmit(&huart2);
+      uart_dma_tx_busy = 0u;
+      HAL_UART_Transmit(&huart2, (uint8_t *)data, len, 1000);
+      return;
+    }
+  }
+  if (len > sizeof(uart_dma_tx_buf))
+  {
+    len = (uint16_t)sizeof(uart_dma_tx_buf);
+  }
+  memcpy(uart_dma_tx_buf, data, len);
+  /* 若将来使能 D-Cache, DMA 读缓冲前必须 clean, 否则可能发出旧数据;
+     当前 D-Cache 未使能, 此调用是空操作. */
+  SCB_CleanDCache_by_Addr((uint32_t *)uart_dma_tx_buf, len);
+  uart_dma_tx_busy = 1u;
+  if (HAL_UART_Transmit_DMA(&huart2, uart_dma_tx_buf, len) != HAL_OK)
+  {
+    /* DMA 启动失败 (如 UART 忙): 回落轮询发送, 避免丢字节 */
+    uart_dma_tx_busy = 0u;
+    HAL_UART_Transmit(&huart2, (uint8_t *)data, len, 1000);
+  }
+}
+
+static void uart_dma_flush_line(void)
+{
+  if (uart_dma_line_len == 0u)
+  {
+    return;
+  }
+  uart_dma_send((const uint8_t *)uart_dma_line_buf, uart_dma_line_len);
+  uart_dma_line_len = 0u;
+}
+
+static void uart_putc_dma(int ch)
+{
+  if (uart_dma_line_len >= sizeof(uart_dma_line_buf))
+  {
+    uart_dma_flush_line();  /* 单行超长: 先把已攒的发掉, 再继续攒 */
+  }
+  uart_dma_line_buf[uart_dma_line_len++] = (char)ch;
+  if (ch == '\n')
+  {
+    uart_dma_flush_line();  /* 行尾: 整行一次 DMA 发出, 行在助手上不可分割 */
+  }
+}
+
 #if defined(__ARMCC_VERSION) && (__ARMCC_VERSION >= 6010050)
 __asm(".global __use_no_semihosting\n\t");
 __asm(".global __ARM_use_no_argv\n\t");
@@ -70,8 +205,7 @@ FILE __stdin;
 int fputc(int ch, FILE *f)
 {
   (void)f;
-  uint8_t c = (uint8_t)ch;
-  HAL_UART_Transmit(&huart2, &c, 1, 1000);
+  uart_putc_dma(ch);
   return ch;
 }
 
@@ -84,16 +218,14 @@ void _sys_exit(int return_code)
 int fputc(int ch, FILE *f)
 {
   (void)f;
-  uint8_t c = (uint8_t)ch;
-  HAL_UART_Transmit(&huart2, &c, 1, 1000);
+  uart_putc_dma(ch);
   return ch;
 }
 #endif
 
 int __io_putchar(int ch)
 {
-  uint8_t c = (uint8_t)ch;
-  HAL_UART_Transmit(&huart2, &c, 1, 1000);
+  uart_putc_dma(ch);
   return ch;
 }
 /* USER CODE END 0 */
@@ -133,6 +265,7 @@ int main(void)
   MX_SPI2_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  uart_dma_init();  /* USART2 TX 切 DMA, 必须在第一条 printf 之前 */
   LHA7878_Reset_GPIO_Init();
   printf("\r\n========================================\r\n");
   printf("  STM32H750 LHA7878 8-Channel ADC Demo\r\n");
@@ -320,6 +453,33 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void DMA1_Stream7_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_usart2_tx);
+}
+
+void USART2_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart2);
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    /* 整行已全部移出移位寄存器, 下一行可发 */
+    uart_dma_tx_busy = 0u;
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    /* 出错也放行, 下一行走超时回落, 不永久卡死 */
+    uart_dma_tx_busy = 0u;
+  }
+}
 
 /* USER CODE END 4 */
 

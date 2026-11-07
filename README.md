@@ -36,6 +36,7 @@
 - **IDE / 编译器**：Keil MDK (uVision 5.32+), 编译器采用 **ArmClang (AC6)**
 - **编译状态**：0 Error(s), 0 Warning(s)
 - **串口波特率**：115200 bps, 8-N-1
+- **串口发送**：USART2 TX 经 DMA1 Stream7 发送（`main.c` 内手工初始化：行缓冲攒满整行后一次 DMA 发出，发送完成由 USART2 TC 中断确认；DMA 初始化失败时自动回落轮询发送）。**CubeMX 侧不要再勾选 USART2 的 DMA**，否则与手工初始化冲突（链接报 `DMA1_Stream7_IRQHandler` 重定义）；若改由 CubeMX 接管，需先删除 `main.c` 里的手工初始化与两个中断服务函数。
 - **输出格式**：
   ```text
   ========================================
