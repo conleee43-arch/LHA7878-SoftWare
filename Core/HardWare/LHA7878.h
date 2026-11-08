@@ -292,6 +292,9 @@ lha7878_status_t lha7878_stop(lha7878_dev_t *dev);
 lha7878_status_t lha7878_start_pin(lha7878_dev_t *dev, bool high); /* START 脚控制 */
 lha7878_status_t lha7878_offset_cal(lha7878_dev_t *dev); /* 约 153ms, 见 §9.5.3.7 */
 
+/* 校准诊断记录: [0]=校准后硬件自改的CONFIG1(预期0x5E), [1]=目标恢复值(0x5B), [2]=校验状态(0=OK), [3]=验证读回值(0x5B) */
+extern volatile uint8_t g_cal_log[8];
+
 /* ------------------------------ 读数 ------------------------------------ */
 lha7878_status_t lha7878_enter_rdatac(lha7878_dev_t *dev);
 lha7878_status_t lha7878_exit_rdatac(lha7878_dev_t *dev); /* 即 SDATAC */

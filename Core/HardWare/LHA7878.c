@@ -527,7 +527,6 @@ lha7878_status_t lha7878_offset_cal(lha7878_dev_t *dev)
     (void)lha7878_read_reg(dev, LHA7878_REG_CONFIG1, &read_back);
     g_cal_log[3] = read_back;
     if (st != LHA7878_OK) {
-        printf("[CALIB] ERROR: Failed to restore CONFIG1 to 0x%02X!\r\n", (unsigned)config1);
         return st;
     }
 

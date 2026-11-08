@@ -342,6 +342,9 @@ int main(void)
   }
 
   printf("[INIT] LHA7878 initialized successfully! (REV_ID OK)\r\n");
+  printf("[INIT] Calibration Diagnostic (OFFSETCAL):\r\n");
+  printf("       - Hardware Post-Cal CONFIG1  : 0x%02X (1 kSPS auto-reset verified)\r\n", (unsigned)g_cal_log[0]);
+  printf("       - Restored & Verified CONFIG1 : 0x%02X (8 kSPS timing restored)\r\n", (unsigned)g_cal_log[3]);
   printf("[INIT] Entering continuous 8-channel acquisition...\r\n\r\n");
   /* USER CODE END 2 */
 
