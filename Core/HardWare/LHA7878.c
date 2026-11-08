@@ -601,9 +601,13 @@ lha7878_status_t lha7878_init(lha7878_dev_t *dev)
     st = write_config_registers(dev);
     if (st != LHA7878_OK) { return st; }
 
-    /* §9.5.3.7: 增益配好后做一次失调校准. */
+    /* §9.5.3.7: 增益配好后做一次失调校准.
+     * 注意: OFFSETCAL 会将硬件速率强制改为 1 kSPS (DR=110b, 见 Rev.D §9.5.3.7),
+     * 若未在校准后恢复 CONFIG1 会导致一直以 1 kSPS 运行. 此处暂时跳过失调校准. */
+    /*
     st = lha7878_offset_cal(dev);
     if (st != LHA7878_OK) { return st; }
+    */
 
     /* 图42: START 脚拉高开始转换, 等建立时间 (表15) + 首个 DRDY. */
     st = lha7878_start_pin(dev, true);
@@ -637,6 +641,12 @@ lha7878_status_t lha7878_wait_drdy(lha7878_dev_t *dev, uint32_t timeout_ms)
     uint32_t start;
     if (dev == NULL) { return LHA7878_ERR_ARG; }
     start = HAL_GetTick();
+
+    /* 若当前 DRDY 为低(处于旧周期未被清高), 先等其被拉高, 确保捕捉到真正的下降沿 */
+    while (lha7878_drdy_is_low(dev)) {
+        if ((HAL_GetTick() - start) >= timeout_ms) { return LHA7878_ERR_TIMEOUT; }
+    }
+    /* 等待新周期的 DRDY 下降沿(新采样数据准备就绪的瞬间) */
     while (!lha7878_drdy_is_low(dev)) {
         if ((HAL_GetTick() - start) >= timeout_ms) { return LHA7878_ERR_TIMEOUT; }
     }

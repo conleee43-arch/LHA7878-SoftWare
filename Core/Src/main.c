@@ -278,8 +278,8 @@ int main(void)
   cfg.vref      = LHA7878_VREF_INT_2V4;   /* 内部 2.4V */
   cfg.avdd_mv   = 5000;                   /* 板上 AVDD 是 5V */
   cfg.dvdd_mv   = 3300;                   /* DVDD 3.3V */
-  cfg.clk_hz    = 2048000;                /* TODO: 待确认外部 2.048MHz 还是内部振荡器 */
-  cfg.sclk_hz   = 4687500;                /* 实际 SCLK = PLL1Q 75MHz / 16 */
+  cfg.clk_hz    = 2048000;                /* CLKSEL Pin 52 接高电平: 内部 2.048MHz 振荡器 */
+  cfg.sclk_hz   = 9375000;                /* 实际 SCLK = PLL1Q 75MHz / 8 */
   for (uint8_t i = 0; i < 8; i++) {
       cfg.gain[i] = LHA7878_GAIN_1;        /* 全通道增益 1 */
       cfg.mux[i]  = LHA7878_MUX_NORMAL;    /* 全通道正常输入 */
@@ -350,6 +350,7 @@ int main(void)
   uint32_t last_print_tick = 0;
   uint32_t sample_count = 0;
   uint32_t row_count = 0;
+  int64_t  raw_accum[8] = {0};
 
   while (1)
   {
@@ -358,17 +359,30 @@ int main(void)
     /* USER CODE BEGIN 3 */
     lha7878_status_t st = lha7878_read_frame(&g_adc_dev, &g_frame, 10);
     if (st == LHA7878_OK || st == LHA7878_ERR_FAULT) {
-        lha7878_frame_to_uv(&g_adc_dev, &g_frame, g_uv);
+        for (uint8_t i = 0; i < 8u; i++) {
+            raw_accum[i] += g_frame.raw[i];
+        }
         sample_count++;
 
         uint32_t now = HAL_GetTick();
         if (now - last_print_tick >= 200) {
+            uint32_t delta_ms = now - last_print_tick;
             last_print_tick = now;
             HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
 
-            /* 每 20 行重印表头, 便于滚动时对照列; 每帧一行, 纵向对比同一通道. */
+            uint32_t actual_sps = (delta_ms > 0) ? (sample_count * 1000u / delta_ms) : 0;
+
+            if (sample_count > 0) {
+                for (uint8_t i = 0; i < 8u; i++) {
+                    int32_t avg_code = (int32_t)(raw_accum[i] / (int64_t)sample_count);
+                    g_uv[i] = lha7878_code_to_uv(avg_code, lha7878_vref_uv(&g_adc_dev), g_adc_dev.cfg.gain[i]);
+                    raw_accum[i] = 0;
+                }
+            }
+
             if (row_count % 20u == 0u) {
-                printf("\r\n  Approx Rate: %lu sps\r\n", (unsigned long)(sample_count * 5));
+                printf("\r\n  Rate: %lu sps (Samples: %lu)\r\n",
+                       (unsigned long)actual_sps, (unsigned long)sample_count);
                 printf("  Frame |    CH1    |    CH2    |    CH3    |    CH4    |    CH5    |    CH6    |    CH7    |    CH8    |  mV\r\n");
             }
             sample_count = 0;

@@ -8,6 +8,7 @@
 *.lnp
 *.build_log.htm
 *.htm
+*.log
 
 # Keil user-specific config
 *.uvguix.*
