@@ -639,17 +639,29 @@ bool lha7878_drdy_is_low(const lha7878_dev_t *dev)
 lha7878_status_t lha7878_wait_drdy(lha7878_dev_t *dev, uint32_t timeout_ms)
 {
     uint32_t start;
+    uint32_t wait_high_timeout;
     if (dev == NULL) { return LHA7878_ERR_ARG; }
     start = HAL_GetTick();
 
-    /* 若当前 DRDY 为低(处于旧周期未被清高), 先等其被拉高, 确保捕捉到真正的下降沿 */
+    /* 阶段 1: 若当前 DRDY 为低 (可能因主循环卡顿导致新帧已在就绪等待):
+     * 先尝试等待其被拉高, 以便捕获下一周期的干净下降沿.
+     * 注意: 未读数时芯片仅在周期末尾刷新时自动拉高 ~1.95 µs, 极易漏检.
+     * 故阶段 1 最多等 2ms (约 16 个采样周期), 若仍为低电平说明移位寄存器中已有就绪帧,
+     * 此时直接返回 OK 兜底放行读取! 发出的 SCLK 会立刻将 DRDY 拉高, 从而瞬间解除自锁并在下一周期重同步. */
+    wait_high_timeout = (timeout_ms < 2u) ? timeout_ms : 2u;
     while (lha7878_drdy_is_low(dev)) {
-        if ((HAL_GetTick() - start) >= timeout_ms) { return LHA7878_ERR_TIMEOUT; }
+        if ((HAL_GetTick() - start) >= wait_high_timeout) {
+            return LHA7878_OK;  /* 兜底破自锁: 直接放行就绪帧读取, 发 SCLK 清高 DRDY */
+        }
     }
-    /* 等待新周期的 DRDY 下降沿(新采样数据准备就绪的瞬间) */
+
+    /* 阶段 2: 等待新周期的 DRDY 下降沿(新采样数据准备就绪的瞬间) */
     while (!lha7878_drdy_is_low(dev)) {
-        if ((HAL_GetTick() - start) >= timeout_ms) { return LHA7878_ERR_TIMEOUT; }
+        if ((HAL_GetTick() - start) >= timeout_ms) {
+            return LHA7878_ERR_TIMEOUT;
+        }
     }
+
     return LHA7878_OK;
 }
 
