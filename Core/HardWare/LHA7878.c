@@ -1,6 +1,8 @@
 /* LHA7878 驱动 -- 完善版, 依据 LHA787X Datasheet CN Rev.D.
  * 编码 UTF-8 无 BOM. 详见 LHA7878.h 头部说明与核对章节清单. */
 #include "LHA7878.h"
+volatile uint8_t g_cal_log[8] = {0};
+
 #include <stdio.h>
 
 #ifndef __weak
@@ -485,12 +487,74 @@ lha7878_status_t lha7878_start_pin(lha7878_dev_t *dev, bool high)
 lha7878_status_t lha7878_offset_cal(lha7878_dev_t *dev)
 {
     lha7878_status_t st;
+    uint8_t config1 = 0;
+    uint8_t cfg1_after_cal = 0;
+    bool was_rdatac = false;
     if (dev == NULL) { return LHA7878_ERR_ARG; }
-    /* §9.5.3.7: 每次改 PGA 增益后建议发一次. 总时间
-     * (19*TDR*8)+1ms = 153ms (1kSPS 下), 等 200ms 再返回. */
+
+    was_rdatac = dev->in_rdatac;
+
+    /* 1. 退出 RDATAC: 发送 SDATAC (RDATAC 模式下芯片会忽略所有命令与寄存器操作) */
+    st = lha7878_exit_rdatac(dev);
+    if (st != LHA7878_OK) { return st; }
+
+    /* 2. 关键: START 引脚必须拉高! 芯片需要运行内部转换收集 16 个点(153ms), START 为低则转换停顿 */
+    st = lha7878_start_pin(dev, true);
+    if (st != LHA7878_OK) { return st; }
+
+    /* 3. 发送 OFFSETCAL 命令并等待 200ms (手册理论耗时 153ms, 芯片在 START=1 下完成校准) */
     st = lha7878_cmd(dev, LHA7878_CMD_OFFSETCAL);
     if (st != LHA7878_OK) { return st; }
     lha7878_delay_ms(200u);
+
+    /* 4. 校准完成, 停转换以便安全重写寄存器 */
+    st = lha7878_start_pin(dev, false);
+    if (st != LHA7878_OK) { return st; }
+
+    /* 检查校准后 CONFIG1 寄存器 */
+    (void)lha7878_read_reg(dev, LHA7878_REG_CONFIG1, &cfg1_after_cal);
+    g_cal_log[0] = cfg1_after_cal;
+
+    /* 5. 关键恢复: 写回目标 8 kSPS 的 CONFIG1 (0x5B) 并回读校验 */
+    config1 = (uint8_t)(LHA7878_CONFIG1_FIXED |
+                         (dev->cfg.multi_readback ? (1u << 6) : 0u) |
+                         (dev->cfg.clk_en ? (1u << 5) : 0u) |
+                         (uint8_t)dev->cfg.data_rate);
+    st = lha7878_write_reg_verify(dev, LHA7878_REG_CONFIG1, config1);
+    g_cal_log[1] = config1;
+    g_cal_log[2] = st;
+    uint8_t read_back = 0;
+    (void)lha7878_read_reg(dev, LHA7878_REG_CONFIG1, &read_back);
+    g_cal_log[3] = read_back;
+    if (st != LHA7878_OK) {
+        printf("[CALIB] ERROR: Failed to restore CONFIG1 to 0x%02X!\r\n", (unsigned)config1);
+        return st;
+    }
+
+    /* 6. 重新拉高 START 开始 8 kSPS 正常采数转换 */
+    st = lha7878_start_pin(dev, true);
+    if (st != LHA7878_OK) { return st; }
+
+    /* 7. 等待 8 kSPS 滤波器建立时间 (settle time) + 初始 DRDY */
+    {
+        uint32_t settle_ms = (uint32_t)(lha7878_settle_tclk[(uint8_t)dev->cfg.data_rate] *
+                                        1000u / dev->cfg.clk_hz) + 10u;
+        uint32_t period_ms = 1000u / lha7878_dr_ksps[(uint8_t)dev->cfg.data_rate] + 2u;
+        st = lha7878_wait_drdy(dev, settle_ms + 2u * period_ms);
+        if (st != LHA7878_OK) { return st; }
+    }
+
+    /* 8. 若原本处于 RDATAC (或配置为 RDATAC), 恢复进 RDATAC 并丢弃前 3 帧未沉降数据 (§9.4.1.2) */
+    if (was_rdatac || dev->cfg.mode == LHA7878_MODE_RDATAC) {
+        st = lha7878_enter_rdatac(dev);
+        if (st != LHA7878_OK) { return st; }
+
+        for (uint8_t i = 0; i < 3u; i++) {
+            lha7878_frame_t dummy;
+            (void)lha7878_read_frame(dev, &dummy, 10u);
+        }
+    }
+
     return LHA7878_OK;
 }
 
@@ -601,30 +665,11 @@ lha7878_status_t lha7878_init(lha7878_dev_t *dev)
     st = write_config_registers(dev);
     if (st != LHA7878_OK) { return st; }
 
-    /* §9.5.3.7: 增益配好后做一次失调校准.
-     * 注意: OFFSETCAL 会将硬件速率强制改为 1 kSPS (DR=110b, 见 Rev.D §9.5.3.7),
-     * 若未在校准后恢复 CONFIG1 会导致一直以 1 kSPS 运行. 此处暂时跳过失调校准. */
-    /*
+    /* §9.5.3.7: 执行完整 7 步失调校准(OFFSETCAL), 自动回写恢复 8 kSPS CONFIG1,
+     * 并恢复 START 转换、等待沉降及恢复 RDATAC 连续采数模式. */
     st = lha7878_offset_cal(dev);
     if (st != LHA7878_OK) { return st; }
-    */
 
-    /* 图42: START 脚拉高开始转换, 等建立时间 (表15) + 首个 DRDY. */
-    st = lha7878_start_pin(dev, true);
-    if (st != LHA7878_OK) { return st; }
-    {
-        uint32_t settle_ms = (uint32_t)(lha7878_settle_tclk[(uint8_t)dev->cfg.data_rate] *
-                                        1000u / dev->cfg.clk_hz) + 10u;
-        uint32_t period_ms = 1000u / lha7878_dr_ksps[(uint8_t)dev->cfg.data_rate] + 2u;
-        st = lha7878_wait_drdy(dev, settle_ms + 2u * period_ms);
-        if (st != LHA7878_OK) { return st; }
-    }
-
-    if (dev->cfg.mode == LHA7878_MODE_RDATAC) {
-        st = lha7878_enter_rdatac(dev);
-        if (st != LHA7878_OK) { return st; }
-    }
-    /* RDATA 模式: 保持 SDATAC 状态, 每帧由 lha7878_read_frame_rdata() 发 RDATA. */
     dev->initialized = true;
     return LHA7878_OK;
 }
